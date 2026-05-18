@@ -1,7 +1,29 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 from einops import rearrange
-from torch import nn
-from torchaudio.transforms import Resample
+
+import math
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+from torchaudio.transforms import Resample, MelSpectrogram
+from torch.nn.utils import weight_norm
+import scipy.signal
+
+from .wavelets import WaveletEncode1d, WaveletDecode1d
+from .blocks import ResidualUnit, WNConv1d
+
+def fold_channels_into_batch(x):
+    x = rearrange(x, 'b c ... -> (b c) ...')
+    return x
+
+def unfold_channels_from_batch(x, channels):
+    if channels == 1:
+        return x.unsqueeze(1)
+    x = rearrange(x, '(b c) ... -> b c ...', c = channels)
+    return x
 
 class Pretransform(nn.Module):
     def __init__(self, enable_grad, io_channels, is_discrete):
@@ -13,6 +35,9 @@ class Pretransform(nn.Module):
         self.downsampling_ratio = None
 
         self.enable_grad = enable_grad
+
+    def forward(self, x):
+        return self.encode(x)
 
     def encode(self, x):
         raise NotImplementedError
@@ -27,10 +52,11 @@ class Pretransform(nn.Module):
         raise NotImplementedError
 
 class AutoencoderPretransform(Pretransform):
-    def __init__(self, model, scale=1.0, model_half=False, iterate_batch=False, chunked=False):
-        super().__init__(enable_grad=False, io_channels=model.io_channels, is_discrete=model.bottleneck is not None and model.bottleneck.is_discrete)
+    def __init__(self, model, scale=1.0, model_half=False, iterate_batch=False, chunked=False, enable_grad = False):
+        super().__init__(enable_grad=enable_grad, io_channels=model.io_channels, is_discrete=model.bottleneck is not None and model.bottleneck.is_discrete)
         self.model = model
-        self.model.requires_grad_(False).eval()
+        if not enable_grad:
+            self.model.requires_grad_(False).eval()
         self.scale=scale
         self.downsampling_ratio = model.downsampling_ratio
         self.io_channels = model.io_channels
@@ -49,9 +75,9 @@ class AutoencoderPretransform(Pretransform):
             self.model.half()
     
     def encode(self, x, **kwargs):
-        
         if self.model_half:
             x = x.half()
+            self.model.to(torch.float16)
 
         encoded = self.model.encode_audio(x, chunked=self.chunked, iterate_batch=self.iterate_batch, **kwargs)
 
@@ -65,6 +91,7 @@ class AutoencoderPretransform(Pretransform):
 
         if self.model_half:
             z = z.half()
+            self.model.to(torch.float16)
 
         decoded = self.model.decode_audio(z, chunked=self.chunked, iterate_batch=self.iterate_batch, **kwargs)
 
@@ -89,10 +116,8 @@ class AutoencoderPretransform(Pretransform):
         self.model.load_state_dict(state_dict, strict=strict)
 
 class WaveletPretransform(Pretransform):
-    def __init__(self, channels, levels, wavelet, **kwargs):
+    def __init__(self, channels, levels, wavelet = "bior4.4", enable_grad = False, **kwargs):
         super().__init__(enable_grad=False, io_channels=channels, is_discrete=False)
-
-        from .wavelets import WaveletEncode1d, WaveletDecode1d
 
         self.encoder = WaveletEncode1d(channels, levels, wavelet)
         self.decoder = WaveletDecode1d(channels, levels, wavelet)
@@ -100,17 +125,17 @@ class WaveletPretransform(Pretransform):
         self.downsampling_ratio = 2 ** levels
         self.io_channels = channels
         self.encoded_channels = channels * self.downsampling_ratio
-    
+
     def encode(self, x):
-        x = self.encoder(x)
+        x = self.encoder(x) 
         return x
     
     def decode(self, z):
         return self.decoder(z)
 
 class PatchedPretransform(Pretransform):
-    def __init__(self, channels, patch_size, oversampling = 1, **kwargs):
-        super().__init__(enable_grad=False, io_channels=channels, is_discrete=False)
+    def __init__(self, channels, patch_size, oversampling = 1, postfilter_channels = 0, **kwargs):
+        super().__init__(enable_grad=True, io_channels=channels, is_discrete=False)
         self.channels = channels
         self.patch_size = patch_size
         self.oversampling = oversampling
@@ -123,29 +148,67 @@ class PatchedPretransform(Pretransform):
             self.input_upsampler = Resample(1, self.oversampling)
             self.output_downsampler = Resample(self.oversampling, 1)
 
+        if postfilter_channels > 0:
+            self.postfilter = nn.Sequential(
+            WNConv1d(in_channels=channels, out_channels=postfilter_channels, kernel_size=7, padding=3, bias=True),
+            ResidualUnit(in_channels=postfilter_channels, out_channels=postfilter_channels,
+                         dilation=1, use_snake=True, bias = True),
+            ResidualUnit(in_channels=postfilter_channels, out_channels=postfilter_channels,
+                         dilation=3, use_snake=True, bias = True),
+            ResidualUnit(in_channels=postfilter_channels, out_channels=postfilter_channels,
+                         dilation=9, use_snake=True, bias = True),
+            WNConv1d(in_channels=postfilter_channels, out_channels=channels, kernel_size=7, padding=3, bias=False))
+
     def _pad(self, x):
         seq_len = x.shape[-1]
         pad_len = (self.patch_size - (seq_len % self.patch_size)) % self.patch_size
         if pad_len > 0:
             x = torch.cat([x, torch.zeros_like(x[:, :, :pad_len])], dim=-1)
         return x
-
+        
     def encode(self, x):
         if self.oversampling > 1:
             x = self.input_upsampler(x)
         x = self._pad(x)
         x = rearrange(x, "b c (l h) -> b (c h) l", h=self.patch_size)
         return x
-    def decode(self, z):
-        x = rearrange(z, "b (c h) l -> b c (l h)", h=self.patch_size)
+    def decode(self, x):
+        x = rearrange(x, "b (c h) l -> b c (l h)", h=self.patch_size)
+        if hasattr(self, 'postfilter'):
+            x = self.postfilter(x)
         if self.oversampling > 1:
             x = self.output_downsampler(x)
         return x
-        
+
+class HILPQMFPretransform(Pretransform):
+    def __init__(self, channels, subbands, taps, beta, cutoff_freq):
+        # TODO: Fix PQMF to take in in-channels
+        super().__init__(enable_grad=False, io_channels=channels, is_discrete=False)
+        from .transforms import PQMF
+        self.channels = channels
+        self.encoded_channels = channels * subbands
+        self.pqmf = PQMF(subbands = subbands, taps = taps, beta = beta, cutoff_freq = cutoff_freq)
+
+    def encode(self, x):
+        # x is (Batch x Channels x Time)
+        x = fold_channels_into_batch(x)
+        pqmf = self.pqmf.analysis(x)
+        pqmf = unfold_channels_from_batch(pqmf, self.channels)
+        pqmf = rearrange(pqmf, 'b c f t -> b (c f) t')
+        return pqmf
+
+    def decode(self, z):
+        z = rearrange(z, "b (c f) t -> b c f t", c=self.channels)
+        z = fold_channels_into_batch(z)
+        x = self.pqmf.synthesis(z)
+        x = unfold_channels_from_batch(x, self.channels)
+        return x
+
+
 class PQMFPretransform(Pretransform):
     def __init__(self, attenuation=100, num_bands=16, channels = 1):
         # TODO: Fix PQMF to take in in-channels
-        super().__init__(enable_grad=False, io_channels=channels, is_discrete=False)
+        super().__init__(enable_grad=True, io_channels=channels, is_discrete=False)
         from .pqmf import PQMF
         self.pqmf = PQMF(attenuation, num_bands)
 
